@@ -3,7 +3,7 @@
 // Austin Shafer - 2020
 extern crate wayland_server as ws;
 use ws::protocol::{
-    wl_data_device as wlddv, wl_data_device_manager as wlddm, wl_data_source as wlds,
+    wl_data_device as wlddv, wl_data_device_manager as wlddm, wl_data_source as wlds, wl_data_offer as wldo
 };
 
 use crate::category5::Climate;
@@ -84,6 +84,29 @@ impl ws::Dispatch<wlds::WlDataSource, ()> for Climate {
         client: &ws::Client,
         resource: &wlds::WlDataSource,
         request: wlds::Request,
+        data: &(),
+        dhandle: &ws::DisplayHandle,
+        data_init: &mut ws::DataInit<'_, Self>,
+    ) {
+        // TODO
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ws::backend::ClientId,
+        _resource: ws::backend::ObjectId,
+        data: &(),
+    ) {
+    }
+}
+
+#[allow(unused_variables)]
+impl ws::Dispatch<wldo::WlDataOffer, ()> for Climate {
+    fn request(
+        state: &mut Self,
+        client: &ws::Client,
+        resource: &wldo::WlDataOffer,
+        request: wldo::Request,
         data: &(),
         dhandle: &ws::DisplayHandle,
         data_init: &mut ws::DataInit<'_, Self>,
