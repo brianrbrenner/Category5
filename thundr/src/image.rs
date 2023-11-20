@@ -3,9 +3,6 @@
 //
 // Austin Shafer - 2020
 #![allow(dead_code)]
-// We allow using dyn Drop here for the drop info fields
-// that will be passed around
-#![allow(dyn_drop)]
 extern crate ash;
 extern crate lluvia as ll;
 extern crate nix;
@@ -13,7 +10,7 @@ extern crate nix;
 use super::renderer::Renderer;
 use utils::log;
 use utils::region::Rect;
-use utils::{Dmabuf, MemImage};
+use utils::Dmabuf;
 
 use std::cell::RefCell;
 use std::fmt;
@@ -26,7 +23,7 @@ use ash::vk;
 use nix::fcntl::{fcntl, FcntlArg};
 use nix::Error;
 
-use crate::Damage;
+use crate::{Damage, Droppable};
 
 // For now we only support one format.
 // According to the mesa source, this supports all modifiers.
@@ -44,7 +41,7 @@ pub struct ImageVk {
     pub iv_image_resolution: vk::Extent2D,
     /// Stuff to release when we are no longer using
     /// this gpu buffer (release the wl_buffer)
-    iv_release_info: Option<Box<dyn Drop>>,
+    iv_release_info: Option<Box<dyn Droppable>>,
 }
 
 impl Drop for ImageVk {
@@ -103,12 +100,15 @@ impl Image {
         return image_vk.iv_image_view;
     }
 
-    pub(crate) fn get_resolution(&self) -> vk::Extent2D {
+    pub fn get_size(&self) -> (u32, u32) {
         let internal = self.i_internal.borrow_mut();
         let rend = internal.i_rend.lock().unwrap();
 
         let image_vk = rend.r_image_vk.get(&internal.i_id).unwrap();
-        return image_vk.iv_image_resolution;
+        (
+            image_vk.iv_image_resolution.width,
+            image_vk.iv_image_resolution.height,
+        )
     }
 
     /// Sets an opaque region for the image to help the internal compositor
@@ -235,16 +235,19 @@ impl Renderer {
     pub fn create_image_from_bits(
         &mut self,
         rend_mtx: Arc<Mutex<Renderer>>,
-        img: &MemImage,
-        _release: Option<Box<dyn Drop>>,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        _release: Option<Box<dyn Droppable>>,
     ) -> Option<Image> {
         unsafe {
             let tex_res = vk::Extent2D {
-                width: img.width as u32,
-                height: img.height as u32,
+                width: width,
+                height: height,
             };
 
-            log::debug!("create_image_from_bits: Image {}x{}", img.width, img.height,);
+            log::debug!("create_image_from_bits: Image {}x{}", width, height,);
 
             //log::error!(
             //    "create_image_from_bits: Image {}x{} checksum {}",
@@ -260,7 +263,7 @@ impl Renderer {
             // client window.
             let (image, view, img_mem) = self.alloc_bgra8_image(&tex_res);
 
-            self.update_image_from_memimg(image, img);
+            self.update_image_from_data(image, data, width, height, stride);
 
             return self.create_image_common(
                 rend_mtx,
@@ -429,7 +432,7 @@ impl Renderer {
         // here to tell vulkan that we should import mem
         // instead of allocating it.
         let mut alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(dmabuf_priv.dp_mem_reqs.size)
+            .allocation_size(dmabuf.db_stride as u64 * dmabuf.db_height as u64)
             .memory_type_index(dmabuf_priv.dp_memtype_index);
 
         // Since we are VERY async/threading friendly here, it is
@@ -496,7 +499,7 @@ impl Renderer {
         &mut self,
         rend_mtx: Arc<Mutex<Renderer>>,
         dmabuf: &Dmabuf,
-        release: Option<Box<dyn Drop>>,
+        release: Option<Box<dyn Droppable>>,
     ) -> Option<Image> {
         self.wait_for_prev_submit();
         self.wait_for_copy();
@@ -613,7 +616,7 @@ impl Renderer {
             .unwrap()
             .iv_image_view;
 
-        log::debug!(
+        log::info!(
             "Image list index {}: writing view {:?}",
             internal.i_id.get_raw_id(),
             view
@@ -642,7 +645,7 @@ impl Renderer {
         image: vk::Image,
         image_mem: vk::DeviceMemory,
         view: vk::ImageView,
-        release: Option<Box<dyn Drop>>,
+        release: Option<Box<dyn Droppable>>,
     ) -> Option<Image> {
         let image_vk = ImageVk {
             iv_rend: rend_mtx.clone(),

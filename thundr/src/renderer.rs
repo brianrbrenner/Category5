@@ -21,12 +21,12 @@ use crate::image::ImageVk;
 use crate::list::SurfaceList;
 use crate::pipelines::PipelineType;
 use crate::platform::VKDeviceFeatures;
-use crate::{Surface, Viewport};
+use crate::{Droppable, Surface, Viewport};
 
 extern crate utils as cat5_utils;
 use crate::{CreateInfo, Damage};
 use crate::{Result, ThundrError};
-use cat5_utils::{log, region::Rect, MemImage};
+use cat5_utils::{log, region::Rect};
 
 // Nvidia aftermath SDK GPU crashdump support
 #[cfg(feature = "aftermath")]
@@ -159,7 +159,7 @@ pub struct Renderer {
     /// This is the set of wayland resources used last frame
     /// for rendering that should now be released
     /// See WindowManger's worker_thread for more
-    pub(crate) r_release: Vec<Box<dyn Drop>>,
+    pub(crate) r_release: Vec<Box<dyn Droppable>>,
     /// command buffer for copying shm images
     pub(crate) copy_cbuf: vk::CommandBuffer,
     pub(crate) copy_cbuf_fence: vk::Fence,
@@ -192,7 +192,7 @@ pub struct Renderer {
     pub r_order_desc_layout: vk::DescriptorSetLayout,
 
     /// The list of window dimensions that is passed to the shader
-    pub r_windows: ll::Session<Window>,
+    pub r_windows: ll::Component<Window>,
     pub r_windows_buf: vk::Buffer,
     pub r_windows_mem: vk::DeviceMemory,
     /// The number of Windows that r_winlist_mem was allocate to hold
@@ -221,9 +221,12 @@ pub struct Renderer {
     pub r_image_ecs: ll::Instance,
     // We keep this around to ensure the image array isn't empty
     r_null_image: ll::Entity,
-    pub r_image_vk: ll::Session<ImageVk>,
-    pub r_image_damage: ll::Session<Damage>,
-    pub r_image_infos: ll::NonSparseSession<vk::DescriptorImageInfo>,
+    pub r_image_vk: ll::Component<ImageVk>,
+    pub r_image_damage: ll::Component<Damage>,
+    pub r_image_infos: ll::NonSparseComponent<vk::DescriptorImageInfo>,
+
+    /// Identical to the parent Thundr struct's session
+    pub r_surface_pass: ll::Component<usize>,
 }
 
 /// This must match the definition of the Window struct in the
@@ -235,9 +238,14 @@ pub struct Renderer {
 #[derive(Default, Copy, Clone, Serialize, Deserialize, Debug)]
 pub struct Window {
     /// The id of the image. This is the offset into the unbounded sampler array.
-    /// w_id.0: id that's the offset into the unbound sampler array
-    /// w_id.1: if we should use w_color instead of texturing
-    pub w_id: (i32, i32, i32, i32),
+    /// id that's the offset into the unbound sampler array
+    pub w_id: i32,
+    /// if we should use w_color instead of texturing
+    pub w_use_color: i32,
+    /// the render pass count
+    pub w_pass: i32,
+    /// Padding to match our shader's struct
+    w_padding: i32,
     /// Opaque color
     pub w_color: (f32, f32, f32, f32),
     /// The complete dimensions of the window.
@@ -296,6 +304,7 @@ impl Renderer {
             .message_severity(
                 vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                     | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
                     | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
             )
             .message_type(
@@ -343,15 +352,20 @@ impl Renderer {
             .application_version(0)
             .engine_name(&app_name)
             .engine_version(0)
-            .api_version(vk::API_VERSION_1_2);
+            .api_version(vk::API_VERSION_1_2)
+            .build();
 
         let mut create_info = vk::InstanceCreateInfo::builder()
             .application_info(&appinfo)
             .enabled_layer_names(&layer_names_raw)
-            .enabled_extension_names(&extension_names_raw);
+            .enabled_extension_names(&extension_names_raw)
+            .build();
 
         let printf_info = vk::ValidationFeaturesEXT::builder()
-            .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::DEBUG_PRINTF])
+            //.enabled_validation_features(&[vk::ValidationFeatureEnableEXT::DEBUG_PRINTF])
+            .enabled_validation_features(&[
+                vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION,
+            ])
             .build();
         create_info.p_next = &printf_info as *const _ as *const std::os::raw::c_void;
 
@@ -658,10 +672,10 @@ impl Renderer {
             .contains(vk::ImageUsageFlags::STORAGE)
         {
             extra_usage |= vk::ImageUsageFlags::STORAGE;
-            log::debug!("Format {:?} supports Storage usage", surface_format.format);
+            log::info!("Format {:?} supports Storage usage", surface_format.format);
         } else {
             assert!(dev_features.vkc_supports_mut_swapchain);
-            log::debug!(
+            log::info!(
                 "Format {:?} does not support Storage usage, using mutable swapchain",
                 surface_format.format
             );
@@ -776,7 +790,7 @@ impl Renderer {
             .map(|&image| {
                 let format_props =
                     inst.get_physical_device_format_properties(pdev, surface_format.format);
-                log::debug!("format props: {:#?}", format_props);
+                log::info!("format props: {:#?}", format_props);
 
                 // we want to interact with this image as a 2D
                 // array of RGBA pixels (i.e. the "normal" way)
@@ -1051,7 +1065,7 @@ impl Renderer {
     /// freed this frame
     ///
     /// Takes care of choosing what list to add info to
-    pub fn register_for_release(&mut self, release: Box<dyn Drop>) {
+    pub fn register_for_release(&mut self, release: Box<dyn Droppable>) {
         self.r_release.push(release);
     }
 
@@ -1199,12 +1213,21 @@ impl Renderer {
     /// Update a Vulkan image from a raw memory region
     ///
     /// This will upload the MemImage to the tansfer buffer, copy it to the image,
-    /// and perform any needed layout conversions along the way
-    pub unsafe fn update_image_from_memimg(&mut self, image: vk::Image, memimg: &MemImage) {
+    /// and perform any needed layout conversions along the way.
+    ///
+    /// A stride of zero implies the data is tightly packed.
+    pub unsafe fn update_image_from_data(
+        &mut self,
+        image: vk::Image,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) {
         self.wait_for_prev_submit();
 
         // Now copy the bits into the image
-        self.upload_memimage_to_transfer(memimg);
+        self.upload_memimage_to_transfer(data);
 
         // Reset the fences for our cbuf submission below
         self.dev.reset_fences(&[self.copy_cbuf_fence]).unwrap();
@@ -1250,9 +1273,8 @@ impl Renderer {
                 // 0 specifies that the pixels are tightly packed
                 .buffer_offset(0)
                 // add stride
-                // This will have been set in the memimg, defaulting to
-                // 0 which means tightly packed.
-                .buffer_row_length(memimg.stride)
+                // 0 means tightly packed.
+                .buffer_row_length(stride)
                 .buffer_image_height(0)
                 .image_subresource(
                     vk::ImageSubresourceLayers::builder()
@@ -1264,8 +1286,8 @@ impl Renderer {
                 )
                 .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
                 .image_extent(vk::Extent3D {
-                    width: memimg.width as u32,
-                    height: memimg.height as u32,
+                    width: width,
+                    height: height,
                     depth: 1,
                 })
                 .build()],
@@ -1463,7 +1485,11 @@ impl Renderer {
     /// All methods called after this only need to take a mutable reference to
     /// self, avoiding any nasty argument lists like the functions above.
     /// The goal is to have this make dealing with the api less wordy.
-    pub fn new(info: &CreateInfo, ecs: &mut ll::Instance) -> Result<Renderer> {
+    pub fn new(
+        info: &CreateInfo,
+        ecs: &mut ll::Instance,
+        pass_comp: ll::Component<usize>,
+    ) -> Result<Renderer> {
         unsafe {
             let (entry, inst) = Renderer::create_instance(info);
 
@@ -1603,7 +1629,10 @@ impl Renderer {
             // size supported. This will only be doable with geom I guess
             // On moltenvk this is like 128, so that's bad
             let (bindless_pool, bindless_layout) =
-                Self::allocate_bindless_resources(&dev, dev_features.max_sampler_count);
+                // Subtract three resources from the theoretical max that the driver reported.
+                // This is to account for our null image and other resources we create in
+                // addition to our bindless count.
+                Self::allocate_bindless_resources(&dev, dev_features.max_sampler_count - 3);
             let bindless_desc =
                 Self::allocate_bindless_desc(&dev, bindless_pool, &[bindless_layout], 1);
 
@@ -1640,23 +1669,14 @@ impl Renderer {
 
             // Create the window list component
             let win_comp = ecs.add_component();
-            let win_sesh = ecs
-                .open_session(win_comp)
-                .ok_or(ThundrError::OUT_OF_MEMORY)?;
 
             // Create our own ECS for the image resources
             let mut img_ecs = ll::Instance::new();
 
             let img_damage_comp = img_ecs.add_component();
-            let img_damage_sesh = img_ecs
-                .open_session(img_damage_comp)
-                .ok_or(ThundrError::OUT_OF_MEMORY)?;
 
             // Add our vulkan resource ECS entry
             let img_vk_comp = img_ecs.add_component();
-            let img_vk_sesh = img_ecs
-                .open_session(img_vk_comp)
-                .ok_or(ThundrError::OUT_OF_MEMORY)?;
 
             // Create the image vk info component
             // We have deleted this image, but it's invalid to pass a
@@ -1664,20 +1684,17 @@ impl Renderer {
             // it with our "null"/"tmp" image, which is just a black square
             let null_sampler = sampler;
             let null_view = tmp_view;
-            let img_info_comp = img_ecs.add_non_sparse_component(move || {
+            let mut img_info_comp = img_ecs.add_non_sparse_component(move || {
                 vk::DescriptorImageInfo::builder()
                     .sampler(null_sampler)
                     .image_view(null_view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .build()
             });
-            let mut img_info_sesh = img_ecs
-                .open_session(img_info_comp)
-                .ok_or(ThundrError::OUT_OF_MEMORY)?;
 
             // Add our null image
             let null_image = img_ecs.add_entity();
-            img_info_sesh.set(
+            img_info_comp.set(
                 &null_image,
                 vk::DescriptorImageInfo::builder()
                     .sampler(sampler)
@@ -1737,7 +1754,7 @@ impl Renderer {
                 r_images_desc_layout: bindless_layout,
                 r_images_desc: bindless_desc,
                 r_images_desc_size: 0,
-                r_windows: win_sesh,
+                r_windows: win_comp,
                 r_windows_buf: vk::Buffer::null(),
                 r_windows_mem: vk::DeviceMemory::null(),
                 r_windows_capacity: 8,
@@ -1751,9 +1768,10 @@ impl Renderer {
                 r_aftermath: aftermath,
                 r_image_ecs: img_ecs,
                 r_null_image: null_image,
-                r_image_vk: img_vk_sesh,
-                r_image_damage: img_damage_sesh,
-                r_image_infos: img_info_sesh,
+                r_image_vk: img_vk_comp,
+                r_image_damage: img_damage_comp,
+                r_image_infos: img_info_comp,
+                r_surface_pass: pass_comp,
             };
             rend.reallocate_windows_buf_with_cap(rend.r_windows_capacity);
 
@@ -1782,7 +1800,7 @@ impl Renderer {
             // first so that any alpha in the children will see this underneath
             let internal = surf.s_internal.borrow();
             if internal.s_image.is_some() || internal.s_color.is_some() {
-                list.l_window_order.push(surf.get_ecs_id().clone());
+                list.push_raw_order(self, &surf.get_ecs_id());
             }
         }
 
@@ -1810,7 +1828,7 @@ impl Renderer {
     ///
     /// This includes dimensions, the image bound, etc.
     fn update_window_list(&mut self, surfaces: &mut SurfaceList) {
-        surfaces.l_window_order.clear();
+        surfaces.clear_order_buf();
 
         for i in (0..surfaces.len()).rev() {
             let s = surfaces[i as usize].clone();
@@ -1838,15 +1856,18 @@ impl Renderer {
             // to tell the shader to ignore this
             None => Rect::new(-1, 0, -1, 0),
         };
-        let (image_id, use_color) = match surf.s_image.as_ref() {
-            Some(i) => (i.get_id().get_raw_id() as i32, false),
-            None => (-1, true),
+        let image_id = match surf.s_image.as_ref() {
+            Some(i) => i.get_id().get_raw_id() as i32,
+            None => -1,
         };
 
         self.r_windows.set(
             &surf_rc.s_window_id,
             Window {
-                w_id: (image_id, use_color as i32, 0, 0),
+                w_id: image_id,
+                w_use_color: surf.s_color.is_some() as i32,
+                w_pass: 0,
+                w_padding: 0,
                 w_color: match surf.s_color {
                     Some((r, g, b, a)) => (r, g, b, a),
                     // magic value so it's easy to debug
@@ -1900,26 +1921,26 @@ impl Renderer {
         }
     }
 
-    pub fn upload_memimage_to_transfer(&mut self, memimg: &MemImage) {
+    pub fn upload_memimage_to_transfer(&mut self, data: &[u8]) {
         unsafe {
             // We might be in the middle of copying the transfer buf to an image
             // wait for that if its the case
             self.wait_for_copy();
-            if memimg.as_slice().len() > self.transfer_buf_len {
+            if data.len() > self.transfer_buf_len {
                 self.free_memory(self.transfer_mem);
                 self.dev.destroy_buffer(self.transfer_buf, None);
                 let (buffer, buf_mem) = self.create_buffer(
                     vk::BufferUsageFlags::TRANSFER_SRC,
                     vk::SharingMode::EXCLUSIVE,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    memimg.as_slice(),
+                    data,
                 );
                 self.transfer_buf = buffer;
                 self.transfer_mem = buf_mem;
-                self.transfer_buf_len = memimg.as_slice().len();
+                self.transfer_buf_len = data.len();
             } else {
                 // copy the data into the staging buffer
-                self.update_memory(self.transfer_mem, 0, memimg.as_slice());
+                self.update_memory(self.transfer_mem, 0, data);
             }
         }
     }
@@ -2080,17 +2101,17 @@ impl Renderer {
         unsafe {
             // The buffer must have been recorded before we can submit
             // it for execution.
-            let submit_info = vk::SubmitInfo::builder()
+            let submits = [vk::SubmitInfo::builder()
                 .wait_semaphores(wait_semas)
                 .wait_dst_stage_mask(wait_stages)
                 .command_buffers(&[cbuf])
                 .signal_semaphores(signal_semas)
-                .build();
+                .build()];
 
             // create a fence to be notified when the commands have finished
             // executing.
             self.dev
-                .queue_submit(queue, &[submit_info], signal_fence)
+                .queue_submit(queue, &submits, signal_fence)
                 .unwrap();
         }
     }
@@ -2142,7 +2163,7 @@ impl Renderer {
             cbuf: self.cbufs[self.current_image as usize],
             image_num: self.current_image as usize,
             // Start at max depth of 1.0 and go to zero
-            starting_depth: 1.0,
+            starting_depth: 0.0,
         }
     }
 
@@ -2576,7 +2597,7 @@ impl Renderer {
                 .image_info(self.r_image_infos.get_data_slice().data())
                 .build(),
         ];
-        log::debug!(
+        log::info!(
             "Raw image infos is {:#?}",
             self.r_image_infos.get_data_slice().data()
         );
@@ -2586,11 +2607,11 @@ impl Renderer {
                 write_infos, // descriptor writes
                 &[],         // descriptor copies
             );
-
-            // We also need to tell the surface list to update its window
-            // order resource
-            surfaces.allocate_order_desc(self);
         }
+
+        // We also need to tell the surface list to update its window
+        // order resource
+        surfaces.allocate_order_desc(self);
     }
 
     /// This refreshes the renderer's internal variable size window
@@ -2623,11 +2644,15 @@ impl Renderer {
                         // For each valid window entry, extract the Window
                         // type from the option so that we can write it to
                         // the Vulkan memory
-                        for id in surfaces.l_window_order.iter() {
-                            let i = id.get_raw_id();
-                            let win = self.r_windows.get(&id).unwrap();
-                            log::debug!("Winlist index {}: writing window {:?}", i, *win);
-                            dst[i] = *win;
+                        for p in surfaces.l_pass.iter() {
+                            if let Some(pass) = p {
+                                for id in pass.p_window_order.iter() {
+                                    let i = id.get_raw_id();
+                                    let win = self.r_windows.get(&id).unwrap();
+                                    log::debug!("Winlist index {}: writing window {:?}", i, *win);
+                                    dst[i] = *win;
+                                }
+                            }
                         }
                     },
                 );
@@ -2637,44 +2662,48 @@ impl Renderer {
 
     /// Update self.current_image with the swapchain image to render to
     ///
-    /// Returns if the next image index was successfully obtained
-    /// false means try again later, the next image is not ready
+    /// If the next image is not ready (i.e. if Vulkan returned NOT_READY or
+    /// TIMEOUT), then this will loop on calling `vkAcquireNextImageKHR` until
+    /// it gets a valid image. This has to be done on AMD hw or else the TIMEOUT
+    /// error will get passed up the callstack and fail.
     pub fn get_next_swapchain_image(&mut self) -> Result<()> {
         unsafe {
-            match self.swapchain_loader.acquire_next_image(
-                self.swapchain,
-                0,                 // use a zero timeout to immediately get the state
-                self.present_sema, // signals presentation
-                vk::Fence::null(),
-            ) {
-                // TODO: handle suboptimal surface regeneration
-                Ok((index, _)) => {
-                    log::debug!(
-                        "Getting next swapchain image: Current {:?}, New {:?}",
-                        self.current_image,
-                        index
-                    );
-                    self.current_image = index;
-                    Ok(())
+            loop {
+                match self.swapchain_loader.acquire_next_image(
+                    self.swapchain,
+                    0,                 // use a zero timeout to immediately get the state
+                    self.present_sema, // signals presentation
+                    vk::Fence::null(),
+                ) {
+                    // TODO: handle suboptimal surface regeneration
+                    Ok((index, _)) => {
+                        log::debug!(
+                            "Getting next swapchain image: Current {:?}, New {:?}",
+                            self.current_image,
+                            index
+                        );
+                        self.current_image = index;
+                        return Ok(());
+                    }
+                    Err(vk::Result::NOT_READY) => {
+                        log::debug!(
+                            "vkAcquireNextImageKHR: vk::Result::NOT_READY: Current {:?}",
+                            self.current_image
+                        );
+                        continue;
+                    }
+                    Err(vk::Result::TIMEOUT) => {
+                        log::debug!(
+                            "vkAcquireNextImageKHR: vk::Result::TIMEOUT: Current {:?}",
+                            self.current_image
+                        );
+                        continue;
+                    }
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Err(ThundrError::OUT_OF_DATE),
+                    Err(vk::Result::SUBOPTIMAL_KHR) => return Err(ThundrError::OUT_OF_DATE),
+                    // the call did not succeed
+                    Err(_) => return Err(ThundrError::COULD_NOT_ACQUIRE_NEXT_IMAGE),
                 }
-                Err(vk::Result::NOT_READY) => {
-                    log::debug!(
-                        "vkAcquireNextImageKHR: vk::Result::NOT_READY: Current {:?}",
-                        self.current_image
-                    );
-                    Err(ThundrError::NOT_READY)
-                }
-                Err(vk::Result::TIMEOUT) => {
-                    log::debug!(
-                        "vkAcquireNextImageKHR: vk::Result::NOT_READY: Current {:?}",
-                        self.current_image
-                    );
-                    Err(ThundrError::TIMEOUT)
-                }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Err(ThundrError::OUT_OF_DATE),
-                Err(vk::Result::SUBOPTIMAL_KHR) => Err(ThundrError::OUT_OF_DATE),
-                // the call did not succeed
-                Err(_) => Err(ThundrError::COULD_NOT_ACQUIRE_NEXT_IMAGE),
             }
         }
     }

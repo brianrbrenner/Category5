@@ -3,13 +3,9 @@ extern crate harfbuzz_rs as hb;
 extern crate harfbuzz_sys as hb_sys;
 
 use crate::th::Thundr;
-use crate::utils::MemImage;
 use crate::{dom, DakotaId};
+use hb::HarfbuzzObject;
 use lluvia as ll;
-
-#[repr(C)]
-#[derive(Clone)]
-struct Pixel(u8, u8, u8, u8);
 
 // Define this ourselves since hb crate doesn't do it
 extern "C" {
@@ -72,46 +68,52 @@ pub struct CachedChar {
     pub offset: (f32, f32),
 }
 
-pub struct FontInstance<'a> {
-    _f_freetype: ft::Library,
+pub struct FontInstance {
     /// The font reference for our rasterizer
     f_ft_face: ft::Face,
     /// Our rustybuzz font face (see harfbuzz docs)
-    f_hb_font: hb::Owned<hb::Font<'a>>,
+    ///
+    /// Note that this is a raw pointer. This is to work around some
+    /// obnoxious lifetime issues. hb::Font<'a> has a lifetime parameter,
+    /// which means if we use it this lifetime has to be specified all the way
+    /// up to the Dakota object. This isn't acceptable since a lifetime parameter
+    /// means Dakota can't be used in environments that require a static lifetime,
+    /// so we have to do this annoying dance here to avoid all of that.
+    ///
+    /// Each time you need a Font object, use hb::Font::from_raw()
+    f_hb_raw_font: *mut harfbuzz_sys::hb_font_t,
     /// Map of glyphs to look up to find the thundr resources
     /// The ab::GlyphId is really just an index into this. That's all
     /// glyph ids are, is the index of the glyph in the font.
     f_glyphs: Vec<Option<Glyph>>,
+    pub f_color: Option<dom::Color>,
 }
 
-impl<'a> FontInstance<'a> {
+impl FontInstance {
     /// Create a new font
     ///
     /// This is a particular font from a typeface at a
     /// particular size. Size is specified in points.
-    pub fn new(font_path: &str, dpi: (u32, u32), point_size: f32) -> Self {
-        let ft_lib = ft::Library::init().unwrap();
+    pub fn new(
+        ft_lib: &ft::Library,
+        font_path: &str,
+        pixel_size: u32,
+        color: Option<dom::Color>,
+    ) -> Self {
         let mut ft_face: ft::Face = ft_lib.new_face(font_path, 0).unwrap();
-        let hb_font = unsafe {
-            let raw_font =
-                hb_ft_font_create_referenced(ft_face.raw_mut() as *mut ft::ffi::FT_FaceRec);
-            hb::Owned::from_raw(raw_font)
-        };
+        let raw_font =
+            unsafe { hb_ft_font_create_referenced(ft_face.raw_mut() as *mut ft::ffi::FT_FaceRec) };
 
-        // set our font size
-        // The sizes come in 1/64th of a point. See the tutorial. Zeroes
-        // default to matching that size, and defaults to 72 dpi
-        // TODO: account for display info
         ft_face
-            .set_char_size(point_size as isize * 64, 0, dpi.0, dpi.1)
+            .set_pixel_sizes(pixel_size, pixel_size)
             //.set_point_sizes(point_size as u32, point_size as u32)
             .expect("Could not set freetype char size");
 
         Self {
-            _f_freetype: ft_lib,
             f_ft_face: ft_face,
-            f_hb_font: hb_font,
+            f_hb_raw_font: raw_font,
             f_glyphs: Vec::new(),
+            f_color: color,
         }
     }
 
@@ -130,9 +132,11 @@ impl<'a> FontInstance<'a> {
         // If the glyph does not have a bitmap, it's an invisible character and
         // we shouldn't make an image for it.
         let th_image = if bitmap.rows() > 0 {
-            let mut img = vec![Pixel(0, 0, 0, 0); (bitmap.width() * bitmap.rows()) as usize]
-                .into_boxed_slice();
             let width = bitmap.width() as usize;
+            let height = bitmap.rows() as usize;
+            let mut img: Vec<u8> = std::iter::repeat(0)
+                .take(width * height * 4 as usize)
+                .collect();
 
             let pixel_mode = bitmap.pixel_mode().expect("Failed to query pixel mode");
 
@@ -146,7 +150,11 @@ impl<'a> FontInstance<'a> {
                 for (i, v) in bitmap.buffer().iter().enumerate() {
                     let x = i % width;
                     let y = i / width;
-                    img[y * width + x] = Pixel(255, 255, 255, *v);
+                    let idx = (y * width + x) * 4;
+                    img[idx] = 255;
+                    img[idx + 1] = 255;
+                    img[idx + 2] = 255;
+                    img[idx + 3] = *v;
                 }
             } else if pixel_mode == ft::bitmap::PixelMode::Bgra {
                 // Handle Colored Pixels
@@ -158,20 +166,26 @@ impl<'a> FontInstance<'a> {
                     let pixel_off = i * 4;
                     let b = bitmap.buffer();
                     // copy the four bgra components into our memimage
-                    img[i] = Pixel(
-                        b[pixel_off],
-                        b[pixel_off + 1],
-                        b[pixel_off + 2],
-                        b[pixel_off + 3],
-                    );
+                    img[i] = b[pixel_off];
+                    img[i + 1] = b[pixel_off + 1];
+                    img[i + 2] = b[pixel_off + 2];
+                    img[i + 3] = b[pixel_off + 3];
                 }
             } else {
                 unimplemented!("Unimplemented freetype pixel mode {:?}", pixel_mode);
             }
 
-            let mimg = MemImage::new(img.as_ptr() as *mut u8, 4, width, bitmap.rows() as usize);
-
-            Some(thund.create_image_from_bits(&mimg, None).unwrap())
+            Some(
+                thund
+                    .create_image_from_bits(
+                        img.as_slice(),
+                        width as u32,
+                        bitmap.rows() as u32,
+                        0,
+                        None,
+                    )
+                    .unwrap(),
+            )
         } else {
             None
         };
@@ -384,7 +398,8 @@ impl<'a> FontInstance<'a> {
         let mut ret = Vec::new();
 
         // Now the big call to get the shaping information
-        let glyph_buffer = hb::shape(&self.f_hb_font, buffer, Vec::with_capacity(0).as_slice());
+        let font = unsafe { hb::Font::from_raw(self.f_hb_raw_font) };
+        let glyph_buffer = hb::shape(&font, buffer, Vec::with_capacity(0).as_slice());
         let infos = glyph_buffer.get_glyph_infos();
         let positions = glyph_buffer.get_glyph_positions();
 

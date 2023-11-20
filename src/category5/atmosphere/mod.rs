@@ -116,7 +116,7 @@
 extern crate wayland_server as ws;
 use ws::protocol::wl_surface;
 
-extern crate thundr as th;
+extern crate dakota as dak;
 
 pub mod property;
 use property::{Property, PropertyId};
@@ -676,6 +676,8 @@ impl Atmosphere {
     /// convert a global location to a surface local coordinates.
     /// Returns None if the location given is not over the surface
     pub fn global_coords_to_surf(&self, id: WindowId, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (x, y) = self.get_adjusted_desktop_coord(x as f32, y as f32);
+        let (x, y) = (x as f64, y as f64);
         // get the surface-local position
         let (wx, wy) = self.get_surface_pos(id);
         let (ww, wh) = self.get_surface_size(id);
@@ -703,24 +705,24 @@ impl Atmosphere {
 
     /// Set the damage for this surface
     /// This will be added once a frame, and then cleared before the next.
-    pub fn set_surface_damage(&mut self, id: WindowId, damage: th::Damage) {
+    pub fn set_surface_damage(&mut self, id: WindowId, damage: dak::Damage) {
         self.a_hemi.as_mut().unwrap().set_surface_damage(id, damage)
     }
     /// For efficiency, this takes the damage so that we can avoid
     /// copying it
-    pub fn take_surface_damage(&mut self, id: WindowId) -> Option<th::Damage> {
+    pub fn take_surface_damage(&mut self, id: WindowId) -> Option<dak::Damage> {
         self.a_hemi.as_mut().unwrap().take_surface_damage(id)
     }
 
     /// Set the damage for this window's buffer
     /// This is the same as set_surface_damage, but operates on buffer coordinates.
     /// It is the preferred method.
-    pub fn set_buffer_damage(&mut self, id: WindowId, damage: th::Damage) {
+    pub fn set_buffer_damage(&mut self, id: WindowId, damage: dak::Damage) {
         self.a_hemi.as_mut().unwrap().set_buffer_damage(id, damage)
     }
     /// For efficiency, this takes the damage so that we can avoid
     /// copying it
-    pub fn take_buffer_damage(&mut self, id: WindowId) -> Option<th::Damage> {
+    pub fn take_buffer_damage(&mut self, id: WindowId) -> Option<dak::Damage> {
         self.a_hemi.as_mut().unwrap().take_buffer_damage(id)
     }
 
@@ -873,8 +875,8 @@ pub struct Hemisphere {
     /// be added elsewhere. A task is a transfer of ownership from
     /// ways to vkcommp
     h_wm_tasks: VecDeque<wm::task::Task>,
-    h_surf_damages: PropertyList<th::Damage>,
-    h_damages: PropertyList<th::Damage>,
+    h_surf_damages: PropertyList<dak::Damage>,
+    h_damages: PropertyList<dak::Damage>,
 }
 
 impl Hemisphere {
@@ -975,22 +977,22 @@ impl Hemisphere {
         self.h_wm_tasks.pop_front()
     }
 
-    fn set_surface_damage(&mut self, id: WindowId, damage: th::Damage) {
+    fn set_surface_damage(&mut self, id: WindowId, damage: dak::Damage) {
         self.mark_changed();
         self.h_surf_damages.update_or_create(id.into(), damage)
     }
-    fn take_surface_damage(&mut self, id: WindowId) -> Option<th::Damage> {
+    fn take_surface_damage(&mut self, id: WindowId) -> Option<dak::Damage> {
         if self.h_surf_damages.id_exists(id.into()) {
             return self.h_surf_damages[id.into()].take();
         }
         return None;
     }
 
-    fn set_buffer_damage(&mut self, id: WindowId, damage: th::Damage) {
+    fn set_buffer_damage(&mut self, id: WindowId, damage: dak::Damage) {
         self.mark_changed();
         self.h_damages.update_or_create(id.into(), damage)
     }
-    fn take_buffer_damage(&mut self, id: WindowId) -> Option<th::Damage> {
+    fn take_buffer_damage(&mut self, id: WindowId) -> Option<dak::Damage> {
         if self.h_damages.id_exists(id.into()) {
             return self.h_damages[id.into()].take();
         }

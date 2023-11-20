@@ -61,7 +61,6 @@
 //! * VK_KHR_debug_report
 //! * VK_KHR_descriptor_indexing
 //! * VK_KHR_external_memory
-#![allow(dyn_drop)]
 
 extern crate lazy_static;
 extern crate lluvia;
@@ -138,6 +137,8 @@ pub enum ThundrError {
     RECORDING_ALREADY_IN_PROGRESS,
     #[error("Thundr Usage Bug: Recording has not been started")]
     RECORDING_NOT_IN_PROGRESS,
+    #[error("Invalid Operation")]
+    INVALID,
 }
 
 pub struct Thundr {
@@ -149,6 +150,9 @@ pub struct Thundr {
     th_rend: Arc<Mutex<Renderer>>,
     /// This is the system used to track all Thundr resources
     th_ecs_inst: ll::Instance,
+
+    /// The render pass a surface belongs to
+    th_surface_pass: ll::Component<usize>,
 
     /// Application specific stuff that will be set up after
     /// the original initialization
@@ -163,7 +167,7 @@ pub struct Thundr {
 ///
 /// The viewport will control what section of the screen is rendered
 /// to. You will specify it when performing draw calls.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Viewport {
     /// This is the position of the viewport on the output
     pub offset: (i32, i32),
@@ -198,9 +202,9 @@ impl Viewport {
 
     /// Set the scrolling within this viewport. This is a global transform
     ///
-    /// This performs bounds checking of `x` and `y` to ensure the are within
+    /// This performs bounds checking of `dx` and `dy` to ensure the are within
     /// `scroll_region`. If they are not, then no scrolling is performed.
-    pub fn set_scroll_amount(&mut self, x: i32, y: i32) {
+    pub fn update_scroll_amount(&mut self, dx: i32, dy: i32) {
         // The min and max bounds here are weird. Think of it like moving the
         // scroll region, not moving the scroll area. It looks like this:
         //
@@ -221,13 +225,13 @@ impl Viewport {
         let min_x = -1 * (self.scroll_region.0 - self.size.0);
         let max_x = 0;
         // now get the new offset
-        let x_offset = self.scroll_offset.0 + x;
+        let x_offset = self.scroll_offset.0 - dx;
         // clamp this offset within our bounds
         let x_clamped = x_offset.clamp(min_x, max_x);
 
         let min_y = -1 * (self.scroll_region.1 - self.size.1);
         let max_y = 0;
-        let y_offset = self.scroll_offset.1 + y;
+        let y_offset = self.scroll_offset.1 - dy;
         let y_clamped = y_offset.clamp(min_y, max_y);
 
         self.scroll_offset = (x_clamped, y_clamped);
@@ -301,15 +305,26 @@ impl<'a> CreateInfoBuilder<'a> {
     }
 }
 
+/// Droppable trait that matches anything.
+///
+/// From https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#dyn-drop
+///
+/// To work around passing dyn Drop we specify a trait that can accept anything. That
+/// way this boxed object can be dropped when the last rendering resource references
+/// it.
+pub trait Droppable {}
+impl<T> Droppable for T {}
+
 // This is the public facing thundr api. Don't change it
 impl Thundr {
     // TODO: make get_available_params and add customization
     pub fn new(info: &CreateInfo) -> Result<Thundr> {
         let mut ecs = ll::Instance::new();
+        let pass_comp = ecs.add_component();
 
         // creates a context, swapchain, images, and others
         // initialize the pipeline, renderpasses, and display engine
-        let mut rend = Renderer::new(&info, &mut ecs)?;
+        let mut rend = Renderer::new(&info, &mut ecs, pass_comp.clone())?;
 
         // Create the pipeline(s) requested
         // Record the type we are using so that we know which type to regenerate
@@ -331,6 +346,7 @@ impl Thundr {
         Ok(Thundr {
             th_rend: Arc::new(Mutex::new(rend)),
             th_ecs_inst: ecs,
+            th_surface_pass: pass_comp,
             _th_pipe_type: ty,
             th_pipe: pipe,
             th_params: None,
@@ -341,7 +357,7 @@ impl Thundr {
     ///
     /// For VK_KHR_display we will calculate it ourselves, and for
     /// SDL we will ask SDL to tell us it.
-    pub fn get_dpi(&self) -> (f32, f32) {
+    pub fn get_dpi(&self) -> Result<(f32, f32)> {
         self.th_rend.lock().unwrap().display.get_dpi()
     }
 
@@ -356,22 +372,27 @@ impl Thundr {
     }
 
     /// create_image_from_bits
+    ///
+    /// A stride of zero implies tightly packed data
     pub fn create_image_from_bits(
         &mut self,
-        img: &MemImage,
-        release_info: Option<Box<dyn Drop>>,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        release_info: Option<Box<dyn Droppable>>,
     ) -> Option<Image> {
         let rend_mtx = self.th_rend.clone();
         let mut rend = self.th_rend.lock().unwrap();
 
-        rend.create_image_from_bits(rend_mtx, &img, release_info)
+        rend.create_image_from_bits(rend_mtx, data, width, height, stride, release_info)
     }
 
     /// create_image_from_dmabuf
     pub fn create_image_from_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
-        release_info: Option<Box<dyn Drop>>,
+        release_info: Option<Box<dyn Droppable>>,
     ) -> Option<Image> {
         let rend_mtx = self.th_rend.clone();
         let mut rend = self.th_rend.lock().unwrap();
@@ -396,6 +417,8 @@ impl Thundr {
     /// image can be bound to multiple surfaces.
     pub fn create_surface(&mut self, x: f32, y: f32, width: f32, height: f32) -> Surface {
         let id = self.th_ecs_inst.add_entity();
+        // Default new surfaces to the original render pass
+        self.th_surface_pass.set(&id, 0);
         let surf = Surface::create_surface(id, x, y, width, height);
         let ecs_capacity = self.th_ecs_inst.num_entities();
 
@@ -406,6 +429,19 @@ impl Thundr {
             .ensure_window_capacity(ecs_capacity);
 
         return surf;
+    }
+
+    /// Change the render pass this surface is a part of
+    ///
+    /// Render passes numbers are Thundr's way of segregating surfaces
+    /// in the same draw lists into separate sub-drawlists while still respecting
+    /// subsurface positioning. Render passes are drawn starting at zero and going
+    /// up, so the user could mark a coupl subsurfaces as pass 1 to have them
+    /// drawn after all other subsurfaces in the tree. This is useful for dakota
+    /// drawing certain elements on top of viewports. Also useful for supporting
+    /// partial drawing.
+    pub fn surface_set_render_pass(&mut self, surf: &Surface, pass: usize) {
+        self.th_surface_pass.set(&surf.get_ecs_id(), pass);
     }
 
     /// Attaches an image to this surface, when this surface
@@ -502,24 +538,38 @@ impl Thundr {
     ///
     /// This is the function for recording drawing of a set of surfaces. The surfaces
     /// in the list will be rendered withing the region specified by viewport.
-    pub fn draw_surfaces(&mut self, surfaces: &SurfaceList, viewport: &Viewport) -> Result<()> {
+    pub fn draw_surfaces(
+        &mut self,
+        surfaces: &SurfaceList,
+        viewport: &Viewport,
+        pass: usize,
+    ) -> Result<()> {
         let params = self
             .th_params
             .as_mut()
             .ok_or(ThundrError::RECORDING_NOT_IN_PROGRESS)?;
+        if pass >= surfaces.l_pass.len() {
+            log::error!(
+                "Pass {} requested but SurfaceList only has {} passes",
+                pass,
+                surfaces.l_pass.len()
+            );
+            return Err(ThundrError::INVALID);
+        }
 
         {
             let mut rend = self.th_rend.lock().unwrap();
             rend.draw_call_submitted =
                 self.th_pipe
-                    .draw(rend.deref_mut(), &params, surfaces, viewport);
+                    .draw(rend.deref_mut(), &params, surfaces, pass, viewport);
         }
 
         // Update the amount of depth used while drawing this surface list. This
         // is the depth we should start subtracting from when drawing the next
         // viewport.
         // This magic 0.0000001 must match geom.vert.glsl
-        params.starting_depth -= surfaces.l_window_order.len() as f32 * 0.0000001;
+        params.starting_depth +=
+            surfaces.l_pass[pass].as_ref().unwrap().p_window_order.len() as f32 / 1000000000.0;
 
         self.draw_surfaces_debug_prints(surfaces, viewport);
 
@@ -548,6 +598,27 @@ impl Thundr {
         self.th_rend.lock().unwrap().present()
     }
 
+    /// Helper for printing all of the subsurfaces under surf.
+    #[cfg(debug_assertions)]
+    fn print_surface(&self, surf: &Surface, i: usize, level: usize) {
+        let img = surf.get_image();
+        log::debug!(
+            "{}[{}] Image={}, Pos={:?}, Size={:?}",
+            std::iter::repeat('-').take(level).collect::<String>(),
+            i,
+            match img {
+                Some(img) => img.get_id().get_raw_id() as i32,
+                None => -1,
+            },
+            surf.get_pos(),
+            surf.get_size()
+        );
+
+        for (i, sub) in surf.s_internal.borrow().s_subsurfaces.iter().enumerate() {
+            self.print_surface(sub, i, level + 1);
+        }
+    }
+
     pub fn draw_surfaces_debug_prints(&mut self, _surfaces: &SurfaceList, _viewport: &Viewport) {
         // Debugging stats
         #[cfg(debug_assertions)]
@@ -557,17 +628,7 @@ impl Thundr {
             log::debug!("Surface List:");
             log::debug!("--------------------------------");
             for (i, s) in _surfaces.iter().enumerate() {
-                let img = s.get_image();
-                log::debug!(
-                    "[{}] Image={}, Pos={:?}, Size={:?}",
-                    i,
-                    match img {
-                        Some(img) => img.get_id().get_raw_id() as i32,
-                        None => -1,
-                    },
-                    s.get_pos(),
-                    s.get_size()
-                );
+                self.print_surface(s, i, 0);
             }
             let rend = self.th_rend.lock().unwrap();
 
@@ -585,7 +646,7 @@ impl Thundr {
                     log::debug!(
                         "[{}] Image={}, Pos={:?}, Size={:?}, Opaque(Pos={:?}, Size={:?})",
                         i,
-                        w.w_id.0,
+                        w.w_id,
                         w.w_dims.r_pos,
                         w.w_dims.r_size,
                         w.w_opaque.r_pos,

@@ -125,8 +125,11 @@ impl Pipeline for GeomPipeline {
         rend: &mut Renderer,
         params: &RecordParams,
         surfaces: &SurfaceList,
+        pass_number: usize,
         viewport: &Viewport,
     ) -> bool {
+        let pass = surfaces.l_pass[pass_number].as_ref().unwrap();
+
         unsafe {
             // Descriptor sets can be updated elsewhere, but
             // they must be bound before drawing
@@ -138,7 +141,7 @@ impl Pipeline for GeomPipeline {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
                 0, // first set
-                &[self.g_desc, surfaces.l_order_desc, rend.r_images_desc],
+                &[self.g_desc, pass.p_order_desc, rend.r_images_desc],
                 &[], // dynamic offsets
             );
 
@@ -158,7 +161,7 @@ impl Pipeline for GeomPipeline {
                 ),
             );
 
-            log::info!("Viewport is : {:?}", viewport);
+            log::error!("Viewport is : {:?}", viewport);
 
             // Set our current viewport
             rend.dev.cmd_set_viewport(
@@ -188,18 +191,43 @@ impl Pipeline for GeomPipeline {
                 }],
             );
 
-            // Here is where everything is actually drawn
-            // technically 3 vertices are being drawn
-            // by the shader
-            rend.dev.cmd_draw_indexed(
-                params.cbuf,                          // drawing command buffer
-                self.vert_count,                      // number of verts
-                surfaces.l_window_order.len() as u32, // number of instances
-                0,                                    // first vertex
-                0,                                    // vertex offset
-                0,                                    // first instance
-            );
-            log::info!("Drawing {} objects", surfaces.l_window_order.len());
+            // Actually draw our objects
+            //
+            // This is done with bindless+instanced drawing. We have one quad object that we will
+            // draw and texture, but instance it for every surface in our surface list. This means
+            // one draw call for any number of elements.
+            //
+            // Unfortunately it seems AMD's driver has a bug where they do not properly handle this
+            // particular draw call sequence. The result is lots of corruption, in the form of
+            // little squares which make it look like compressed pixel data was written to a linear
+            // texture. So on AMD we do not do the instancing, but instead have a draw call for
+            // every object (gross)
+            if pass.p_window_order.len() > 0 {
+                if rend.dev_features.vkc_war_disable_instanced_drawing {
+                    for i in 0..pass.p_window_order.len() as u32 {
+                        // [WAR] Launch each instance manually :(
+                        // TODO: skip if incorrect pass
+                        rend.dev.cmd_draw_indexed(
+                            params.cbuf,     // drawing command buffer
+                            self.vert_count, // number of verts
+                            1,               // number of instances
+                            0,               // first vertex
+                            0,               // vertex offset
+                            i as u32,        // first instance
+                        );
+                    }
+                } else {
+                    rend.dev.cmd_draw_indexed(
+                        params.cbuf,                      // drawing command buffer
+                        self.vert_count,                  // number of verts
+                        pass.p_window_order.len() as u32, // number of instances
+                        0,                                // first vertex
+                        0,                                // vertex offset
+                        0,                                // first instance
+                    );
+                }
+            }
+            log::info!("Drawing {} objects", pass.p_window_order.len());
         }
 
         return true;
@@ -454,7 +482,7 @@ impl GeomPipeline {
                 },
                 vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
+                        depth: 0.0,
                         stencil: 0,
                     },
                 },
@@ -535,6 +563,7 @@ impl GeomPipeline {
                 samples: vk::SampleCountFlags::TYPE_1,
                 load_op: vk::AttachmentLoadOp::CLEAR,
                 store_op: vk::AttachmentStoreOp::STORE,
+                initial_layout: vk::ImageLayout::UNDEFINED,
                 final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
                 ..Default::default()
             },
@@ -755,10 +784,10 @@ impl GeomPipeline {
         let depth_info = vk::PipelineDepthStencilStateCreateInfo {
             depth_test_enable: 1,
             depth_write_enable: 1,
-            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+            depth_compare_op: vk::CompareOp::GREATER_OR_EQUAL,
             front: stencil_state,
             back: stencil_state,
-            max_depth_bounds: 1.0,
+            // one million objects is our max for now
             ..Default::default()
         };
 
@@ -775,9 +804,8 @@ impl GeomPipeline {
             color_write_mask: vk::ColorComponentFlags::RGBA,
         }];
 
-        let blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
-            .logic_op(vk::LogicOp::CLEAR)
-            .attachments(&blend_attachment_states);
+        let blend_info =
+            vk::PipelineColorBlendStateCreateInfo::builder().attachments(&blend_attachment_states);
 
         // dynamic state specifies what parts of the pipeline will be
         // specified at draw time. (like moving the viewport)

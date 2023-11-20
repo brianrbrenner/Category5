@@ -30,7 +30,9 @@ enum Element {
         width: Option<dom::Value>,
         height: Option<dom::Value>,
     },
-    Text(Vec<dom::TextItem>),
+    Text(Vec<dom::TextItem>, Option<String>),
+    TextFont(Option<String>),
+    PixelSize(Option<u32>),
     Window {
         title: Option<String>,
         width: Option<u32>,
@@ -40,7 +42,6 @@ enum Element {
     Dakota {
         version: Option<String>,
         window: Option<dom::Window>,
-        resource_map: Option<dom::ResourceMap>,
         root_element: Option<DakotaId>,
     },
     Version(Option<String>),
@@ -60,7 +61,7 @@ enum Element {
     X(Option<dom::Value>),
     Y(Option<dom::Value>),
     Relative(Option<f32>),
-    Constant(Option<u32>),
+    Constant(Option<i32>),
     R(Option<f32>),
     G(Option<f32>),
     B(Option<f32>),
@@ -70,8 +71,9 @@ enum Element {
     Image(Option<dom::Format>, Option<dom::Data>),
     Format(Option<dom::Format>),
     Data(dom::Data),
-    ResourceMap(dom::ResourceMap),
+    ResourceMap,
     Resource(Option<String>),
+    FontDefinition(Option<String>, Option<String>, u32, Option<dom::Color>),
     ResourceDefinition {
         name: Option<String>,
         image: Option<dom::Image>,
@@ -97,6 +99,7 @@ enum Element {
     Resize(Option<dom::Event>),
     RedrawComplete(Option<dom::Event>),
     Closed(Option<dom::Event>),
+    UnboundedSubsurface,
 }
 
 impl Element {
@@ -108,7 +111,9 @@ impl Element {
                 width: None,
                 height: None,
             },
-            b"text" => Self::Text(Vec::new()),
+            b"text" => Self::Text(Vec::new(), None),
+            b"font" => Self::TextFont(None),
+            b"pixel_size" => Self::PixelSize(None),
             b"window" => Self::Window {
                 title: None,
                 width: None,
@@ -118,7 +123,6 @@ impl Element {
             b"dakota" => Self::Dakota {
                 version: None,
                 window: None,
-                resource_map: None,
                 root_element: None,
             },
             b"version" => Self::Version(None),
@@ -151,10 +155,9 @@ impl Element {
                 rel_path: None,
                 abs_path: None,
             }),
-            b"resourceMap" => Self::ResourceMap(dom::ResourceMap {
-                resources: Vec::new(),
-            }),
+            b"resourceMap" => Self::ResourceMap,
             b"resource" => Self::Resource(None),
+            b"define_font" => Self::FontDefinition(None, None, 0, None),
             b"define_resource" => Self::ResourceDefinition {
                 name: None,
                 image: None,
@@ -180,6 +183,7 @@ impl Element {
             b"resize" => Self::Resize(None),
             b"redraw_complete" => Self::RedrawComplete(None),
             b"closed" => Self::Closed(None),
+            b"unbounded_subsurface" => Self::UnboundedSubsurface,
             _ => {
                 return Err(anyhow!(
                     "Element name {} is not a valid element name",
@@ -228,9 +232,11 @@ struct ParseData {
     /// all the elements to reference resources without holding
     /// a giant array of resources somewhere.
     name_to_id_map: HashMap<String, DakotaId>,
+    /// Similar motivation but for font definitions
+    font_name_to_id_map: HashMap<String, DakotaId>,
 }
 
-impl<'a> Dakota<'a> {
+impl Dakota {
     /// Parse a string of Dakota XML
     ///
     /// This provides a way to initialize a full application view from a
@@ -265,6 +271,7 @@ impl<'a> Dakota<'a> {
                 color: _,
                 hints: _,
             } => Ok(Some(self.create_resource()?)),
+            Element::FontDefinition(_, _, _, _) => Ok(Some(self.create_font_instance()?)),
             Element::El {
                 x: _,
                 y: _,
@@ -275,7 +282,6 @@ impl<'a> Dakota<'a> {
             Element::Dakota {
                 version: _,
                 window: _,
-                resource_map: _,
                 root_element: _,
             } => Ok(Some(self.create_dakota_dom()?)),
             _ => Ok(None),
@@ -286,16 +292,20 @@ impl<'a> Dakota<'a> {
     ///
     /// This is used to get an id for a resource even if it has not yet
     /// been created
-    fn get_id_for_name(&mut self, parse: &mut ParseData, name: &str) -> Result<DakotaId> {
-        if !parse.name_to_id_map.contains_key(name) {
-            parse.name_to_id_map.insert(
+    fn get_id_for_name(
+        &mut self,
+        name_to_id_map: &mut HashMap<String, DakotaId>,
+        name: &str,
+    ) -> Result<DakotaId> {
+        if !name_to_id_map.contains_key(name) {
+            name_to_id_map.insert(
                 name.to_string(),
                 self.create_resource()
                     .context("Creating DakotaId for Resource Definition")?,
             );
         }
 
-        Ok(parse.name_to_id_map.get(name).unwrap().clone())
+        Ok(name_to_id_map.get(name).unwrap().clone())
     }
 
     /// Helper function for turning a string into a DOM object
@@ -326,6 +336,10 @@ impl<'a> Dakota<'a> {
         old_id: &DakotaId,
         old_node: &Element,
     ) -> Result<()> {
+        // [node/id] is the current element that we are modifying
+        // old_[node/id] is the child XML element that just had its end tag
+        // complete. We are propogating its data up the tree to [node/id]
+
         match node {
             // Element
             // -------------------------------------------------------
@@ -338,13 +352,14 @@ impl<'a> Dakota<'a> {
                 Element::Resource(name) => {
                     let resource_id = self
                         .get_id_for_name(
-                            parse,
+                            &mut parse.name_to_id_map,
                             name.as_ref()
                                 .ok_or(anyhow!("Element was not assigned a resource"))?,
                         )
                         .context("Getting resource reference for element")?;
-                    self.set_resource(id, resource_id)
+                    self.d_resources.set(id, resource_id)
                 }
+                Element::UnboundedSubsurface => self.d_unbounded_subsurf.set(id, true),
                 Element::El {
                     x: _,
                     y: _,
@@ -355,13 +370,22 @@ impl<'a> Dakota<'a> {
                 Element::Y(val) => *y = *val,
                 Element::Width(val) => *width = *val,
                 Element::Height(val) => *height = *val,
-                Element::Text(data) => self.set_text(
-                    id,
-                    dom::Text {
-                        items: data.clone(),
-                    },
-                ),
-                Element::Content(data) => self.set_content(
+                Element::Text(data, font) => {
+                    self.d_texts.set(
+                        id,
+                        dom::Text {
+                            items: data.clone(),
+                        },
+                    );
+                    // font is optional
+                    if let Some(name) = font {
+                        let resource_id = self
+                            .get_id_for_name(&mut parse.font_name_to_id_map, name)
+                            .context("Getting resource reference for element")?;
+                        self.d_text_font.set(id, resource_id);
+                    }
+                }
+                Element::Content(data) => self.d_contents.set(
                     id,
                     dom::Content {
                         el: data
@@ -369,18 +393,16 @@ impl<'a> Dakota<'a> {
                             .ok_or(anyhow!("Content does not contain an element"))?,
                     },
                 ),
-                Element::Size(width, height) => self.set_size(
-                    id,
-                    dom::RelativeSize {
-                        width: width
-                            .clone()
-                            .ok_or(anyhow!("Content does not contain an element"))?,
-                        height: height
-                            .clone()
-                            .ok_or(anyhow!("Content does not contain an element"))?,
-                    },
-                ),
-                Element::Offset(x, y) => self.set_offset(
+                Element::Size(width, height) => {
+                    // Widths and heights are optional
+                    if let Some(width) = width {
+                        self.d_widths.set(id, *width);
+                    }
+                    if let Some(height) = height {
+                        self.d_heights.set(id, *height);
+                    }
+                }
+                Element::Offset(x, y) => self.d_offsets.set(
                     id,
                     dom::RelativeOffset {
                         x: x.clone()
@@ -411,26 +433,35 @@ impl<'a> Dakota<'a> {
             Element::Dakota {
                 version,
                 window,
-                resource_map,
                 root_element,
             } => match old_node {
                 Element::Version(data) => *version = data.clone(),
-                Element::ResourceMap(data) => *resource_map = Some(data.clone()),
+                Element::ResourceMap => {}
                 Element::Window {
                     title,
                     width,
                     height,
                     events,
                 } => {
+                    let mut size = None;
+
+                    if let Some(w) = width {
+                        size = Some((*w, 0));
+                    }
+                    if let Some(h) = height {
+                        size.as_mut()
+                            .ok_or(anyhow!(
+                                "Must specify both width and height of Window or none at all"
+                            ))?
+                            .1 = *h;
+                    }
+
                     *window = Some(dom::Window {
                         title: title
                             .as_ref()
                             .ok_or(anyhow!("Window does not contain title field"))?
                             .clone(),
-                        width: width
-                            .ok_or(anyhow!("Window does not contain window_width field"))?,
-                        height: height
-                            .ok_or(anyhow!("Window does not contain window_height field"))?,
+                        size: size,
                         events: events.clone(),
                     })
                 }
@@ -438,9 +469,12 @@ impl<'a> Dakota<'a> {
                 e => return Err(anyhow!("Unexpected child element: {:?}", e)),
             },
             // -------------------------------------------------------
-            Element::Text(data) => match old_node {
+            Element::Text(data, font) => match old_node {
                 Element::P(s) => data.push(dom::TextItem::p(self.get_text_run(s)?)),
                 Element::Bold(s) => data.push(dom::TextItem::b(self.get_text_run(s)?)),
+                Element::TextFont(name) => {
+                    *font = Some(name.clone().context("Font name not specified")?)
+                }
                 e => return Err(anyhow!("Unexpected child element: {:?}", e)),
             },
             Element::Width(data) | Element::Height(data) | Element::X(data) | Element::Y(data) => {
@@ -474,7 +508,30 @@ impl<'a> Dakota<'a> {
                 e => return Err(anyhow!("Unexpected child element: {:?}", e)),
             },
             // -------------------------------------------------------
-            Element::ResourceMap(map) => match old_node {
+            Element::ResourceMap => match old_node {
+                Element::FontDefinition(name, path, size, color) => {
+                    let resource_id = self
+                        .get_id_for_name(
+                            &mut parse.font_name_to_id_map,
+                            name.as_ref()
+                                .ok_or(anyhow!("Font definition does not have a name"))?,
+                        )
+                        .context("Getting resource id for font definition")?;
+
+                    self.define_font(
+                        &resource_id,
+                        dom::Font {
+                            name: name
+                                .clone()
+                                .ok_or(anyhow!("Font definition does not have a name"))?,
+                            path: path
+                                .clone()
+                                .ok_or(anyhow!("Font Definition requires name tag"))?,
+                            pixel_size: *size,
+                            color: *color,
+                        },
+                    );
+                }
                 Element::ResourceDefinition {
                     name,
                     image,
@@ -484,25 +541,37 @@ impl<'a> Dakota<'a> {
                     // Look up this resource's id
                     let resource_id = self
                         .get_id_for_name(
-                            parse,
+                            &mut parse.name_to_id_map,
                             name.as_ref()
                                 .ok_or(anyhow!("Resource definition does not have a name"))?,
                         )
                         .context("Getting resource id for resource definition")?;
 
-                    self.set_resource_definition(
-                        &resource_id,
-                        dom::Resource {
-                            name: name
-                                .clone()
-                                .ok_or(anyhow!("Name field not specified in <define_resource>"))?,
-                            image: image.clone(),
-                            color: color.clone(),
-                            hints: hints.clone(),
-                        },
-                    );
+                    if let Some(h) = hints.clone() {
+                        self.d_resource_hints.set(&resource_id, h);
+                    }
 
-                    map.resources.push(resource_id);
+                    // If this resource is backed by an image, populate it
+                    if let Some(i) = image.as_ref() {
+                        let file_path = std::path::Path::new(i.data.get_fs_path()?);
+                        self.define_resource_from_image(&resource_id, &file_path, i.format)?;
+                    } else if let Some(c) = color.as_ref() {
+                        self.d_resource_color.set(&resource_id, *c);
+                    }
+                }
+                e => return Err(anyhow!("Unexpected child element: {:?}", e)),
+            },
+            Element::FontDefinition(name, path, size, color) => match old_node {
+                Element::Name(n) => *name = n.clone(),
+                Element::AbsPath(p) | Element::RelPath(p) => *path = p.clone(),
+                Element::PixelSize(s) => *size = s.context("PixelSize was not populated")?,
+                Element::Color { r, g, b, a } => {
+                    *color = Some(dom::Color {
+                        r: r.clone().ok_or(anyhow!("Color value R not specified"))?,
+                        g: g.clone().ok_or(anyhow!("Color value G not specified"))?,
+                        b: b.clone().ok_or(anyhow!("Color value B not specified"))?,
+                        a: a.clone().ok_or(anyhow!("Color value A not specified"))?,
+                    })
                 }
                 e => return Err(anyhow!("Unexpected child element: {:?}", e)),
             },
@@ -510,7 +579,6 @@ impl<'a> Dakota<'a> {
                 name,
                 image,
                 color,
-                // TODO: fill this in
                 hints,
             } => match old_node {
                 Element::Name(n) => *name = n.clone(),
@@ -527,9 +595,9 @@ impl<'a> Dakota<'a> {
                 Element::Color { r, g, b, a } => {
                     *color = Some(dom::Color {
                         r: r.clone().ok_or(anyhow!("Color value R not specified"))?,
-                        g: g.clone().ok_or(anyhow!("Color value R not specified"))?,
-                        b: b.clone().ok_or(anyhow!("Color value R not specified"))?,
-                        a: a.clone().ok_or(anyhow!("Color value R not specified"))?,
+                        g: g.clone().ok_or(anyhow!("Color value G not specified"))?,
+                        b: b.clone().ok_or(anyhow!("Color value B not specified"))?,
+                        a: a.clone().ok_or(anyhow!("Color value A not specified"))?,
                     })
                 }
                 Element::Hints(data) => *hints = Some(data.clone()),
@@ -619,6 +687,7 @@ impl<'a> Dakota<'a> {
                     | Element::Arg(data)
                     | Element::Title(data)
                     | Element::Resource(data)
+                    | Element::TextFont(data)
                     | Element::Name(data) => *data = Some(text),
                     // float fields
                     Element::R(data)
@@ -631,9 +700,15 @@ impl<'a> Dakota<'a> {
                                 .context("Could not parse float value for text in element")?,
                         )
                     }
+                    Element::Constant(data) => {
+                        *data =
+                            Some(text.parse::<i32>().context(
+                                "Could not parse unsigned int value for text in element",
+                            )?)
+                    }
                     // unsigned int fields
-                    Element::Constant(data)
-                    | Element::WindowWidth(data)
+                    Element::WindowWidth(data)
+                    | Element::PixelSize(data)
                     | Element::WindowHeight(data) => {
                         *data =
                             Some(text.parse::<u32>().context(
@@ -682,6 +757,7 @@ impl<'a> Dakota<'a> {
         // Our parsing data
         let mut parse = ParseData {
             name_to_id_map: HashMap::new(),
+            font_name_to_id_map: HashMap::new(),
         };
 
         // The DakotaId we are currently populating
@@ -713,8 +789,9 @@ impl<'a> Dakota<'a> {
                     }
                     node = Some(ty);
                 }
-                Ok(Event::End(e)) => {
-                    log::verbose!("XML EVENT: {:#?}", e);
+                Ok(Event::End(_e)) => {
+                    log::verbose!("XML EVENT: {:#?}", _e);
+                    // Save a copy of the XML element that just ended
                     let old_id = id.clone();
                     let old_node = node;
 
@@ -729,19 +806,15 @@ impl<'a> Dakota<'a> {
                                 Some(Element::Dakota {
                                     version,
                                     window,
-                                    resource_map,
                                     root_element,
                                 }) => {
-                                    self.set_dakota_dom(
+                                    self.d_dom.set(
                                         old_id.as_ref().unwrap(),
                                         dom::DakotaDOM {
                                             version: version
                                                 .clone()
                                                 .ok_or(anyhow!("Dakota missing field version"))?,
                                             window: window
-                                                .clone()
-                                                .ok_or(anyhow!("Dakota missing field version"))?,
-                                            resource_map: resource_map
                                                 .clone()
                                                 .ok_or(anyhow!("Dakota missing field version"))?,
                                             root_element: root_element

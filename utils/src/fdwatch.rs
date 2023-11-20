@@ -6,8 +6,8 @@ extern crate nix;
 
 #[cfg(not(target_os = "freebsd"))]
 use nix::sys::select::*;
-#[cfg(not(target_os = "freebsd"))]
-use nix::sys::time::{TimeVal, TimeValLike};
+
+use nix::unistd::close;
 
 #[cfg(target_os = "freebsd")]
 use nix::sys::event::*;
@@ -24,6 +24,7 @@ pub struct FdWatch {
     fdw_kq: RawFd,
     // Events to watch
     fdw_events: Vec<KEvent>,
+    fdw_fds: Vec<RawFd>,
 }
 
 #[cfg(target_os = "freebsd")]
@@ -53,12 +54,24 @@ impl FdWatch {
             // Create a new kqueue
             fdw_kq: kqueue().expect("Could not create kqueue"),
             fdw_events: Vec::new(),
+            fdw_fds: Vec::new(),
         }
     }
 
     pub fn add_fd(&mut self, fd: RawFd) {
         let kev = FdWatch::read_fd_kevent(fd);
         self.fdw_events.push(kev);
+        self.fdw_fds.push(fd);
+    }
+
+    pub fn remove_fd(&mut self, fd: RawFd) {
+        let index = self
+            .fdw_fds
+            .iter()
+            .position(|f| *f == fd)
+            .expect("FdWatch: Could not find requested fd");
+        self.fdw_events.remove(index);
+        self.fdw_fds.remove(index);
     }
 
     pub fn register_events(&mut self) {
@@ -68,8 +81,18 @@ impl FdWatch {
     }
 
     // returns true if something is ready to be read
-    pub fn wait_for_events(&mut self) -> bool {
-        kevent_ts(self.fdw_kq, &[], self.fdw_events.as_mut_slice(), None).is_ok()
+    pub fn wait_for_events(&mut self, timeout: Option<usize>) -> bool {
+        match timeout {
+            Some(ms) => kevent(self.fdw_kq, &[], self.fdw_events.as_mut_slice(), ms).is_ok(),
+            None => kevent_ts(self.fdw_kq, &[], self.fdw_events.as_mut_slice(), None).is_ok(),
+        }
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+impl Drop for FdWatch {
+    fn drop(&mut self) {
+        close(self.fdw_kq).expect("Could not close FdWatch Kqueue fd");
     }
 }
 
@@ -96,26 +119,38 @@ impl FdWatch {
         self.fdw_events.push(fd);
     }
 
+    pub fn remove_fd(&mut self, fd: RawFd) {
+        self.fdw_events.retain(|&f| f != fd);
+    }
+
     pub fn register_events(&mut self) {
         // noop since select doesn't need registration
     }
 
     // timeout in ms
     // returns true if something is ready to be read
-    pub fn wait_for_events(&mut self, timeout: usize) -> bool {
+    pub fn wait_for_events(&mut self, timeout: Option<usize>) -> bool {
+        use crate::fdwatch::nix::sys::time::TimeValLike;
+
         let mut fdset = FdSet::new();
         for fd in self.fdw_events.iter() {
             fdset.insert(*fd);
         }
 
         // add all of our fds to the readfd list
-        select(
-            None,
-            Some(&mut fdset),
-            None,
-            None,
-            Some(&mut TimeVal::milliseconds(timeout as i64)),
-        )
-        .is_ok()
+        let mut out = match timeout {
+            Some(ms) => Some(nix::sys::time::TimeVal::milliseconds(ms as i64)),
+            None => None,
+        };
+        select(None, Some(&mut fdset), None, None, out.as_mut()).is_ok()
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+impl Drop for FdWatch {
+    fn drop(&mut self) {
+        for fd in self.fdw_events.iter() {
+            close(*fd).expect("Could not close FdWatch fd");
+        }
     }
 }
