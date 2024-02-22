@@ -205,3 +205,10 @@ fn get_set_opt() {
     c.set_opt(&e1, None);
     assert_eq!(c.get_clone(&e1), None);
 }
+
+#[test]
+fn torture_test() {
+    for _ in 0..1000000 {
+        snapshot_test()
+    }
+}
