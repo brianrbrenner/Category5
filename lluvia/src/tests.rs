@@ -208,7 +208,19 @@ fn get_set_opt() {
 
 #[test]
 fn torture_test() {
-    for _ in 0..1000000 {
-        snapshot_test()
+    let mut inst = ll::Instance::new();
+    let mut v= Vec::new();
+    for _ in 0..100000 {
+        v.push(Some(inst.add_entity()));
+    }
+
+    for i in 30000..80000 {
+        if i % 2 == 0 {
+            v[i].take();
+        }
+    }
+
+    for _ in 0..40000 {
+        v.push(Some(inst.add_entity()));
     }
 }
