@@ -521,7 +521,7 @@ struct IdTable {
     /// scan the entire list if it's full
     i_total_num_ids: usize,
     /// This is a list of active ids in the system.
-    i_valid_ids: Vec<bool>,
+    i_valid_ids: Vec<usize>,
 }
 
 impl IdTable {
@@ -539,44 +539,45 @@ impl IdTable {
         self.i_total_num_ids
     }
 
-    /// Get the largest entity value
+    /// Get the allocated space
     ///
     /// This is essentially the capacity of the entity array
     fn capacity(&self) -> usize {
-        self.i_valid_ids.len()
+        self.i_valid_ids.len() * usize::BITS as usize
     }
 
     /// Mint a new id number
     fn create_id(&mut self) -> usize {
         // Find the first free id that is not in use or make one
-        let first_valid_id = {
-            let mut index = None;
+        let mut bit_index = None;
+        let mut block_index = None;
 
-            // first check the array from back to front
-            // Don't do this if the array is full, just skip to extending the
-            // array if that is the case
-            if self.i_total_num_ids != self.i_valid_ids.len() {
-                for (i, is_valid) in self.i_valid_ids.iter().enumerate().rev() {
-                    if !*is_valid {
-                        index = Some(i);
+        for i in 0..self.i_valid_ids.len() {
+            // if not max usize at i, from right to left find 0 and flip it
+            if !(self.i_valid_ids[i] == usize::MAX) {
+                block_index = Some(i);
+                for j in 0..usize::MAX {
+                    if self.i_valid_ids[i] >> j & 1 == 0 {
+                        let mask = 1 << j;
+                        // flip 0 -> 1 at given pos
+                        self.i_valid_ids[i] & !mask | mask;
+                        bit_index = Some(usize::MAX - j);
                         break;
                     }
                 }
+                break;
             }
+        }
 
-            // if that didn't work then add one to the back
-            if index.is_none() {
-                self.i_valid_ids.push(true);
-                index = Some(self.i_valid_ids.len() - 1);
-            }
-
-            index.unwrap()
-        };
-        // Mark this new id as active
-        self.i_valid_ids[first_valid_id] = true;
         self.i_total_num_ids += 1;
-
-        first_valid_id
+        // if that didn't work then push new usize
+        if bit_index.is_none() {
+            let bit_index = usize::MIN | usize::BITS as usize;
+            self.i_valid_ids.push(bit_index);
+            return self.i_valid_ids.len() - 1 * bit_index;
+        } else {
+            block_index.unwrap() * bit_index.unwrap()
+        }
     }
 
     /// Free an id and mark it unused
