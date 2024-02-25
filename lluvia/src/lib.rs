@@ -553,15 +553,15 @@ impl IdTable {
         let mut block_index = None;
 
         for i in 0..self.i_valid_ids.len() {
-            // if not max usize at i, from right to left find 0 and flip it
+            // if not max usize at i, from left to right find 0 and flip it
             if !(self.i_valid_ids[i] == usize::MAX) {
                 block_index = Some(i);
                 for j in 0..usize::MAX {
-                    if self.i_valid_ids[i] >> j & 1 == 0 {
+                    if self.i_valid_ids[i] << j & 1 == 0 {
                         let mask = 1 << j;
                         // flip 0 -> 1 at given pos
-                        self.i_valid_ids[i] & !mask | mask;
-                        bit_index = Some(usize::MAX - j);
+                        self.i_valid_ids[i] = self.i_valid_ids[i] & !mask | mask;
+                        bit_index = Some(j);
                         break;
                     }
                 }
